@@ -5,7 +5,7 @@ import logging
 import ctypes
 import numpy as np
 from dataclasses import dataclass
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from tqdm import tqdm
 import os
 from mooncake.store import MooncakeDistributedStore
@@ -14,7 +14,12 @@ import queue
 import copy
 import math
 import sys
+import socket
+import pickle
+import struct
+import uuid
 from collections import defaultdict
+from multiprocessing import Process, Queue as MPQueue
 
 # Disable memcpy optimization
 os.environ["MC_STORE_MEMCPY"] = "0"
@@ -26,6 +31,226 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger('stress_cluster_benchmark')
+
+
+class KeyQueueServer:
+    """TCP-based queue server for cross-server key distribution.
+
+    This server manages a queue that prefill instances push keys to
+    and decode instances pop keys from.
+    """
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.queue = MPQueue()
+        self.server_socket = None
+        self.running = True
+
+    def start(self):
+        """Start the queue server (blocking)."""
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(10)
+        logger.info(f"KeyQueueServer listening on {self.host}:{self.port}")
+
+        try:
+            while self.running:
+                self.server_socket.settimeout(1.0)
+                try:
+                    client_socket, addr = self.server_socket.accept()
+                    logger.info(f"New client connection from {addr}")
+                    threading.Thread(
+                        target=self._handle_client,
+                        args=(client_socket, addr),
+                        daemon=True
+                    ).start()
+                except socket.timeout:
+                    continue
+        except Exception as e:
+            logger.error(f"Server error: {e}")
+        finally:
+            self.server_socket.close()
+
+    def stop(self):
+        """Stop the queue server."""
+        self.running = False
+
+    def _handle_client(self, client_socket: socket.socket, addr):
+        """Handle a single client connection."""
+        try:
+            while self.running:
+                # Read message length (4 bytes, big-endian)
+                length_data = self._recv_exact(client_socket, 4)
+                if not length_data:
+                    break
+                msg_length = struct.unpack('>I', length_data)[0]
+
+                # Read message body
+                data = self._recv_exact(client_socket, msg_length)
+                if not data:
+                    break
+
+                request = pickle.loads(data)
+                response = self._process_request(request)
+
+                # Send response
+                response_data = pickle.dumps(response)
+                client_socket.sendall(struct.pack('>I', len(response_data)) + response_data)
+        except ConnectionResetError:
+            logger.info(f"Client {addr} disconnected")
+        except Exception as e:
+            logger.error(f"Error handling client {addr}: {e}")
+        finally:
+            client_socket.close()
+
+    def _recv_exact(self, sock: socket.socket, n: int) -> Optional[bytes]:
+        """Receive exactly n bytes from socket."""
+        data = b''
+        while len(data) < n:
+            try:
+                chunk = sock.recv(n - len(data))
+                if not chunk:
+                    return None
+                data += chunk
+            except socket.timeout:
+                if not self.running:
+                    return None
+                continue
+        return data
+
+    def _process_request(self, request: dict) -> dict:
+        """Process a client request."""
+        cmd = request.get('cmd')
+
+        if cmd == 'push':
+            keys = request.get('keys', [])
+            for key in keys:
+                self.queue.put(key)
+            return {'status': 'ok', 'count': len(keys)}
+
+        elif cmd == 'pop':
+            count = request.get('count', 1)
+            timeout = request.get('timeout', 10.0)
+            keys = []
+            for _ in range(count):
+                try:
+                    key = self.queue.get(timeout=timeout)
+                    keys.append(key)
+                except Exception:
+                    break
+            return {'status': 'ok', 'keys': keys}
+
+        elif cmd == 'size':
+            try:
+                size = self.queue.qsize()
+            except NotImplementedError:
+                size = -1  # qsize() not implemented on some platforms
+            return {'status': 'ok', 'size': size}
+
+        elif cmd == 'ping':
+            return {'status': 'ok', 'message': 'pong'}
+
+        else:
+            return {'status': 'error', 'message': f'Unknown command: {cmd}'}
+
+
+class KeyQueueClient:
+    """Client for connecting to KeyQueueServer across servers."""
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.socket = None
+        self.lock = threading.Lock()
+        self.connected = False
+
+    def connect(self, retry_count: int = 5, retry_delay: float = 2.0):
+        """Connect to the queue server with retries."""
+        for attempt in range(retry_count):
+            try:
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.socket.connect((self.host, self.port))
+                self.connected = True
+                logger.info(f"Connected to KeyQueueServer at {self.host}:{self.port}")
+                return
+            except ConnectionRefusedError:
+                if attempt < retry_count - 1:
+                    logger.warning(f"Connection refused, retrying in {retry_delay}s... ({attempt + 1}/{retry_count})")
+                    time.sleep(retry_delay)
+                else:
+                    raise ConnectionError(f"Failed to connect to KeyQueueServer at {self.host}:{self.port} after {retry_count} attempts")
+
+    def _send_request(self, request: dict) -> dict:
+        """Send a request and receive response."""
+        if not self.connected:
+            raise ConnectionError("Not connected to KeyQueueServer")
+
+        with self.lock:
+            data = pickle.dumps(request)
+            self.socket.sendall(struct.pack('>I', len(data)) + data)
+
+            # Read response length
+            length_data = self._recv_exact(4)
+            if not length_data:
+                raise ConnectionError("Connection closed while reading response length")
+            msg_length = struct.unpack('>I', length_data)[0]
+
+            # Read response body
+            response_data = self._recv_exact(msg_length)
+            if not response_data:
+                raise ConnectionError("Connection closed while reading response")
+
+            return pickle.loads(response_data)
+
+    def _recv_exact(self, n: int) -> Optional[bytes]:
+        """Receive exactly n bytes from socket."""
+        data = b''
+        while len(data) < n:
+            chunk = self.socket.recv(n - len(data))
+            if not chunk:
+                return None
+            data += chunk
+        return data
+
+    def push_keys(self, keys: List[str]) -> int:
+        """Push keys to the queue. Returns number of keys pushed."""
+        response = self._send_request({'cmd': 'push', 'keys': keys})
+        if response.get('status') != 'ok':
+            raise RuntimeError(f"Push failed: {response.get('message', 'Unknown error')}")
+        return response.get('count', 0)
+
+    def pop_keys(self, count: int, timeout: float = 30.0) -> List[str]:
+        """Pop keys from the queue. Returns list of keys."""
+        response = self._send_request({'cmd': 'pop', 'count': count, 'timeout': timeout})
+        if response.get('status') != 'ok':
+            raise RuntimeError(f"Pop failed: {response.get('message', 'Unknown error')}")
+        return response.get('keys', [])
+
+    def get_size(self) -> int:
+        """Get the current queue size."""
+        response = self._send_request({'cmd': 'size'})
+        return response.get('size', -1)
+
+    def ping(self) -> bool:
+        """Check if server is responsive."""
+        try:
+            response = self._send_request({'cmd': 'ping'})
+            return response.get('status') == 'ok'
+        except Exception:
+            return False
+
+    def close(self):
+        """Close the connection."""
+        if self.socket:
+            self.socket.close()
+            self.connected = False
+
+
+def generate_random_key(prefix: str = "key") -> str:
+    """Generate a random unique key using UUID."""
+    return f"{prefix}_{uuid.uuid4().hex}"
 
 
 @dataclass
@@ -177,6 +402,7 @@ class TestInstance:
         self.performance_tracker = PerformanceTracker()
         self.buffer_array = None
         self.buffer_ptr = None
+        self.key_queue_client: Optional[KeyQueueClient] = None
 
     def setup(self):
         """Initialize the MooncakeDistributedStore and allocate registered memory."""
@@ -215,7 +441,21 @@ class TestInstance:
             exit(1)
 
         logger.info(f"Allocated and registered {buffer_size // (1024*1024)} MB buffer for zero-copy operations")
+
+        # Connect to key queue server if address is provided
+        if self.args.key_queue_server:
+            host, port = self.args.key_queue_server.split(':')
+            self.key_queue_client = KeyQueueClient(host, int(port))
+            self.key_queue_client.connect()
+            logger.info(f"Connected to key queue server at {self.args.key_queue_server}")
+
         time.sleep(1)
+
+    def teardown(self):
+        """Clean up resources."""
+        if self.key_queue_client:
+            self.key_queue_client.close()
+            logger.info("Closed key queue client connection")
 
     def _calculate_total_batches(self) -> int:
         """Calculate the total number of batches needed."""
@@ -284,7 +524,148 @@ class TestInstance:
         self.performance_tracker.stop_timer()
         logger.info(f"{operation_type.capitalize()} phase completed. Failed operations: {total_failed_operations}")
         self._print_performance_stats(operation_type.upper())
-        
+
+        logger.info(f"Waiting {self.args.wait_time} seconds...")
+        time.sleep(self.args.wait_time)
+
+    def _run_benchmark_with_random_keys(self, operation_type: str, operation_func):
+        """Benchmark runner for prefill that generates random keys and pushes to queue."""
+        logger.info(f"Starting {operation_type} operations: {self.args.max_requests} requests")
+        logger.info(f"Batch size: {self.args.batch_size}, Value size: {self.args.value_length // (1024*1024)} MB")
+        if self.key_queue_client:
+            logger.info("Keys will be pushed to cross-server queue")
+
+        total_operations = 0
+        total_failed_operations = 0
+        total_batches = self._calculate_total_batches()
+
+        with tqdm(total=total_batches,
+                  desc=f"{operation_type.capitalize()} batches",
+                  unit="batch",
+                  postfix={"failed_ops": 0}) as pbar:
+
+            while total_operations < self.args.max_requests:
+                remaining = self.args.max_requests - total_operations
+                current_batch_size = min(self.args.batch_size, remaining)
+
+                # Generate random keys for this batch
+                keys = [generate_random_key(f"key_{self.args.thread_id}") for _ in range(current_batch_size)]
+
+                op_start = time.perf_counter()
+                return_codes = operation_func(keys, current_batch_size)
+                op_end = time.perf_counter()
+
+                operation_latency = op_end - op_start
+
+                batch_result = BatchResult(keys, return_codes, operation_type)
+
+                if batch_result.num_failed() > 0:
+                    batch_result.log_failures(max_failures_to_log=3)
+
+                successful_ops = batch_result.num_succeeded()
+                failed_ops = batch_result.num_failed()
+                total_failed_operations += failed_ops
+                self.performance_tracker.failed_operations += failed_ops
+                self.performance_tracker.total_operations += current_batch_size
+
+                for code in return_codes:
+                    if code != 0:
+                        self.performance_tracker.record_error(code)
+
+                if successful_ops > 0:
+                    total_data_size = successful_ops * self.args.value_length
+                    self.performance_tracker.record_operation(operation_latency, total_data_size)
+                    self.performance_tracker.bytes_transferred += total_data_size
+
+                total_operations += current_batch_size
+
+                pbar.update(1)
+                pbar.set_postfix({"failed_ops": total_failed_operations})
+
+        self.performance_tracker.stop_timer()
+        logger.info(f"{operation_type.capitalize()} phase completed. Failed operations: {total_failed_operations}")
+        self._print_performance_stats(operation_type.upper())
+
+        logger.info(f"Waiting {self.args.wait_time} seconds...")
+        time.sleep(self.args.wait_time)
+
+    def _run_benchmark_with_queue_keys(self, operation_type: str, operation_func):
+        """Benchmark runner for decode that pops keys from queue."""
+        logger.info(f"Starting {operation_type} operations: {self.args.max_requests} requests")
+        logger.info(f"Batch size: {self.args.batch_size}, Value size: {self.args.value_length // (1024*1024)} MB")
+
+        if not self.key_queue_client:
+            logger.warning("No key queue client configured, falling back to sequential keys")
+            return self._run_benchmark(operation_type, operation_func)
+
+        logger.info("Keys will be popped from cross-server queue")
+
+        total_operations = 0
+        total_failed_operations = 0
+        total_batches = self._calculate_total_batches()
+        empty_queue_count = 0
+        max_empty_retries = 10
+
+        with tqdm(total=total_batches,
+                  desc=f"{operation_type.capitalize()} batches",
+                  unit="batch",
+                  postfix={"failed_ops": 0, "queue_waits": 0}) as pbar:
+
+            while total_operations < self.args.max_requests:
+                remaining = self.args.max_requests - total_operations
+                current_batch_size = min(self.args.batch_size, remaining)
+
+                # Pop keys from the queue
+                keys = self.key_queue_client.pop_keys(current_batch_size, timeout=30.0)
+
+                if not keys:
+                    empty_queue_count += 1
+                    pbar.set_postfix({"failed_ops": total_failed_operations, "queue_waits": empty_queue_count})
+                    if empty_queue_count >= max_empty_retries:
+                        logger.warning(f"Queue empty after {max_empty_retries} retries, stopping")
+                        break
+                    logger.info(f"Queue empty, waiting... (attempt {empty_queue_count}/{max_empty_retries})")
+                    time.sleep(1.0)
+                    continue
+
+                empty_queue_count = 0  # Reset on successful pop
+                actual_batch_size = len(keys)
+
+                op_start = time.perf_counter()
+                return_codes = operation_func(keys, actual_batch_size)
+                op_end = time.perf_counter()
+
+                operation_latency = op_end - op_start
+
+                batch_result = BatchResult(keys, return_codes, operation_type)
+
+                if batch_result.num_failed() > 0:
+                    batch_result.log_failures(max_failures_to_log=3)
+
+                successful_ops = batch_result.num_succeeded()
+                failed_ops = batch_result.num_failed()
+                total_failed_operations += failed_ops
+                self.performance_tracker.failed_operations += failed_ops
+                self.performance_tracker.total_operations += actual_batch_size
+
+                for code in return_codes:
+                    if code < 0:
+                        self.performance_tracker.record_error(code)
+
+                if successful_ops > 0:
+                    total_data_size = successful_ops * self.args.value_length
+                    self.performance_tracker.record_operation(operation_latency, total_data_size)
+                    self.performance_tracker.bytes_transferred += total_data_size
+
+                total_operations += actual_batch_size
+
+                pbar.update(1)
+                pbar.set_postfix({"failed_ops": total_failed_operations, "queue_waits": empty_queue_count})
+
+        self.performance_tracker.stop_timer()
+        logger.info(f"{operation_type.capitalize()} phase completed. Failed operations: {total_failed_operations}")
+        self._print_performance_stats(operation_type.upper())
+
         logger.info(f"Waiting {self.args.wait_time} seconds...")
         time.sleep(self.args.wait_time)
 
@@ -295,10 +676,9 @@ class TestInstance:
             for i in range(batch_size):
                 start_idx = i * self.args.value_length
                 end_idx = start_idx + self.args.value_length
-                
-                # Simple pattern: fill with key index for each key
-                key_index = int(keys[i].replace("key", ""))
-                pattern = key_index % 256
+
+                # Simple pattern: fill with hash of key for randomness
+                pattern = hash(keys[i]) % 256
                 self.buffer_array[start_idx:end_idx] = pattern
 
             # Prepare buffer pointers and sizes for batch operation
@@ -309,9 +689,20 @@ class TestInstance:
                 buffer_ptrs.append(self.buffer_ptr + offset)
                 sizes.append(self.args.value_length)
 
-            return self.store.batch_put_from(keys, buffer_ptrs, sizes)
+            return_codes = self.store.batch_put_from(keys, buffer_ptrs, sizes)
 
-        self._run_benchmark("prefill", put_batch)
+            # Push successfully written keys to the queue
+            if self.key_queue_client:
+                successful_keys = [
+                    keys[i] for i, code in enumerate(return_codes) if code == 0
+                ]
+                if successful_keys:
+                    self.key_queue_client.push_keys(successful_keys)
+                    logger.debug(f"Pushed {len(successful_keys)} keys to queue")
+
+            return return_codes
+
+        self._run_benchmark_with_random_keys("prefill", put_batch)
 
     def decode(self):
         """Execute decode operations using zero-copy batch get."""
@@ -326,7 +717,7 @@ class TestInstance:
 
             return self.store.batch_get_into(keys, buffer_ptrs, sizes)
 
-        self._run_benchmark("decode", get_batch)
+        self._run_benchmark_with_queue_keys("decode", get_batch)
 
     def _print_performance_stats(self, operation_type: str):
         """Print comprehensive performance statistics in a structured format."""
@@ -403,6 +794,9 @@ def worker_thread(args, results_queue, start_barrier, end_barrier):
         else:
             tester.prefill()
 
+        # Cleanup
+        tester.teardown()
+
         # Put results in the queue
         results_queue.put(tester.performance_tracker)
         logger.info(f"Worker thread {thread_name} completed successfully")
@@ -426,8 +820,9 @@ def parse_arguments():
     )
 
     # Role configuration
-    parser.add_argument("--role", type=str, choices=["prefill", "decode"], required=True,
-                       help="Role of this instance: prefill (producer) or decode (consumer)")
+    parser.add_argument("--role", type=str, choices=["prefill", "decode"], default=None,
+                       help="Role of this instance: prefill (producer) or decode (consumer). "
+                            "Required unless running as queue server.")
 
     # Network and connection settings
     parser.add_argument("--protocol", type=str, default="rdma", help="Communication protocol to use")
@@ -451,8 +846,18 @@ def parse_arguments():
                        help="Number of worker threads to use for concurrent operations")
     
     # Statistics parameters
-    parser.add_argument("--detailed-stats", action="store_true", 
+    parser.add_argument("--detailed-stats", action="store_true",
                        help="Enable detailed statistics per worker thread")
+
+    # Cross-server key queue parameters
+    parser.add_argument("--key-queue-server", type=str, default=None,
+                       help="Address of the key queue server (host:port). "
+                            "Prefill pushes keys, decode pops keys.")
+    parser.add_argument("--run-queue-server", action="store_true",
+                       help="Run as a key queue server instead of benchmark. "
+                            "Use with --key-queue-server to specify bind address.")
+    parser.add_argument("--queue-server-port", type=int, default=50052,
+                       help="Port to bind when running as queue server")
 
     return parser.parse_args()
 
@@ -508,9 +913,41 @@ def print_performance_stats(stats: Dict[str, Any], title: str):
     logger.info(report)
 
 
+def run_queue_server(host: str, port: int):
+    """Run the key queue server."""
+    logger.info("=== Mooncake Key Queue Server ===")
+    logger.info(f"Binding to {host}:{port}")
+    logger.info("Press Ctrl+C to stop")
+    logger.info("=" * 50)
+
+    server = KeyQueueServer(host, port)
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        logger.info("\nShutting down queue server...")
+        server.stop()
+
+
 def main():
     """Main entry point for the stress test."""
     args = parse_arguments()
+
+    # Handle queue server mode
+    if args.run_queue_server:
+        host = "0.0.0.0"
+        port = args.queue_server_port
+        if args.key_queue_server:
+            parts = args.key_queue_server.split(':')
+            host = parts[0] if parts[0] else "0.0.0.0"
+            if len(parts) > 1:
+                port = int(parts[1])
+        run_queue_server(host, port)
+        return
+
+    # Validate role is provided for benchmark mode
+    if not args.role:
+        logger.error("--role is required when running benchmark (use --role prefill or --role decode)")
+        sys.exit(1)
 
     logger.info("=== Mooncake Zero-Copy Batch Benchmark ===")
     logger.info(f"Role: {args.role.upper()}")
@@ -519,6 +956,8 @@ def main():
     logger.info(f"Batch size: {args.batch_size}")
     logger.info(f"Value size: {args.value_length // (1024*1024)} MB")
     logger.info(f"Number of workers: {args.num_workers}")
+    if args.key_queue_server:
+        logger.info(f"Key queue server: {args.key_queue_server}")
     logger.info("=" * 50)
 
     try:
@@ -591,6 +1030,8 @@ def main():
                 tester.decode()
             else:
                 tester.prefill()
+
+            tester.teardown()
 
         logger.info("Test completed successfully!")
 
